@@ -42,12 +42,12 @@
 /* ===================== DHT11 (PTC3) ===================== */
 #define DHT_PORT           PORTC
 #define DHT_GPIO           GPIOC
-#define DHT_PIN            3U
+#define DHT_PIN            16U
 
 /* ===================== BUZZER (PTC4) ===================== */
 #define BUZ_PORT           PORTC
 #define BUZ_GPIO           GPIOC
-#define BUZ_PIN            4U
+#define BUZ_PIN            8U
 
 /* ===================== Smoke thresholds (tune if needed) ===================== */
 #define SMOKE_WARN_MV      1000U
