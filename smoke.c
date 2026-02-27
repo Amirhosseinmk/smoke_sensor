@@ -1,22 +1,3 @@
-/*
- * Smoke + DHT11 + OLED + Buzzer (NO TERMINAL)
- * FRDM-K66F - BAREMETAL
- *
- * OLED:
- *   T:xxC
- *   H:yy%
- *   S:NRM / WRN / DNG
- *
- * BUZZER (continuous patterns):
- *  - DANGER (Smoke DNG or Temp >= 60C): continuous ON
- *  - WARNING (Smoke WRN or Temp>=40 or Hum>=80): repeating beeps (0/1/0/1 with clear OFF time)
- *  - Else: OFF
- *
- * DHT11 is read every 1000ms (safe for DHT11 ~1Hz).
- * DHT11 is double-read (use 2nd if OK, otherwise 1st) to reduce sticky readings.
- * Buzzer timing is non-blocking (state machine) and updated every 10ms.
- */
-
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -31,6 +12,7 @@
 #include "fsl_gpio.h"
 #include "fsl_port.h"
 #include "fsl_i2c.h"
+#include "fsl_uart.h"
 
 /* ===================== MQ-2 ADC (PTB3) ===================== */
 #define ADC_BASE           ADC0
@@ -39,17 +21,25 @@
 #define ADC_VREF_MV        3300U
 #define ADC_MAX_COUNTS     4095U
 
-/* ===================== DHT11 (PTC3) ===================== */
+/* ===================== DHT11 (PTC16) ===================== */
 #define DHT_PORT           PORTC
 #define DHT_GPIO           GPIOC
 #define DHT_PIN            16U
 
-/* ===================== BUZZER (PTC4) ===================== */
+/* ===================== BUZZER (PTC8) ===================== */
 #define BUZ_PORT           PORTC
 #define BUZ_GPIO           GPIOC
 #define BUZ_PIN            8U
 
-/* ===================== Smoke thresholds (tune if needed) ===================== */
+/* ===================== ESP8266 UART1 (PTC4=TX, PTC3=RX) ===================== */
+#define WIFI_UART          UART1
+#define WIFI_UART_CLK      kCLOCK_Uart1
+#define WIFI_UART_PORT     PORTC
+#define WIFI_UART_TX_PIN   4U
+#define WIFI_UART_RX_PIN   3U
+#define WIFI_UART_BAUD     9600U
+
+/* ===================== Smoke thresholds ===================== */
 #define SMOKE_WARN_MV      1000U
 #define SMOKE_DANGER_MV    1600U
 #define SMOKE_HYST_MV      50U
@@ -58,11 +48,10 @@
 #define TEMP_WARN1_C       40U
 #define TEMP_DANGER_C      60U
 #define HUM_WARN1_PCT      80U
-
 #define TEMP_HYST_C        1U
 #define HUM_HYST_PCT       2U
 
-/* ===================== Buzzer beep pattern (WRN) ===================== */
+/* ===================== Buzzer beep pattern ===================== */
 #define BEEP_ON_MS         80U
 #define BEEP_OFF_MS        420U
 
@@ -74,10 +63,7 @@ static void DWT_Init(void)
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 }
 
-static inline uint32_t DWT_GetCycles(void)
-{
-    return DWT->CYCCNT;
-}
+static inline uint32_t DWT_GetCycles(void) { return DWT->CYCCNT; }
 
 static void delay_us(uint32_t us)
 {
@@ -93,11 +79,36 @@ static void delay_ms(uint32_t ms)
 
 static uint32_t millis(void)
 {
-    uint32_t cpm = SystemCoreClock / 1000U;
-    return DWT_GetCycles() / cpm;
+    return DWT_GetCycles() / (SystemCoreClock / 1000U);
 }
 
-/* ===================== DHT11 helpers ===================== */
+/* ===================== ESP8266 UART ===================== */
+static void WIFI_UART_Init(void)
+{
+    CLOCK_EnableClock(kCLOCK_PortC);
+    PORT_SetPinMux(WIFI_UART_PORT, WIFI_UART_TX_PIN, kPORT_MuxAlt3);
+    PORT_SetPinMux(WIFI_UART_PORT, WIFI_UART_RX_PIN, kPORT_MuxAlt3);
+    CLOCK_EnableClock(WIFI_UART_CLK);
+
+    uart_config_t cfg;
+    UART_GetDefaultConfig(&cfg);
+    cfg.baudRate_Bps = WIFI_UART_BAUD;
+    cfg.enableTx = true;
+    cfg.enableRx = true;
+
+    /* Try 30MHz - half of 60MHz bus clock */
+    UART_Init(WIFI_UART, &cfg, 180000000U);
+}
+
+static void WIFI_UART_SendLine(uint8_t t, uint8_t h, const char *s_txt)
+{
+    char buf[48];
+    int n = snprintf(buf, sizeof(buf), "T=%u,H=%u,S=%s\r\n", t, h, s_txt);
+    if (n > 0)
+        UART_WriteBlocking(WIFI_UART, (uint8_t*)buf, (size_t)n);
+}
+
+/* ===================== DHT11 ===================== */
 static inline void dht_output(void) { DHT_GPIO->PDDR |=  (1U << DHT_PIN); }
 static inline void dht_input(void)  { DHT_GPIO->PDDR &= ~(1U << DHT_PIN); }
 static inline void dht_low(void)    { DHT_GPIO->PCOR  =  (1U << DHT_PIN); }
@@ -112,12 +123,8 @@ static uint8_t wait_level(uint8_t level, uint32_t timeout_us)
 {
     uint32_t cycles = (SystemCoreClock / 1000000U) * timeout_us;
     uint32_t start  = DWT_GetCycles();
-
     while (dht_read_pin() != level)
-    {
-        if ((DWT_GetCycles() - start) > cycles)
-            return 1;
-    }
+        if ((DWT_GetCycles() - start) > cycles) return 1;
     return 0;
 }
 
@@ -128,7 +135,6 @@ static uint8_t dht11_read(uint8_t *tempC, uint8_t *hum)
     dht_output();
     dht_low();
     delay_ms(18);
-
     dht_high();
     delay_us(30);
     dht_input();
@@ -185,35 +191,12 @@ static void Buzzer_SetMode(buz_mode_t m)
 static void Buzzer_Tick(void)
 {
     uint32_t now = millis();
-
-    if (g_buz.mode == BUZ_OFF)
-    {
-        Buzzer_Set(0);
-        g_buz.is_on = 0;
-        return;
-    }
-
-    if (g_buz.mode == BUZ_DANGER_ON)
-    {
-        Buzzer_Set(1);
-        g_buz.is_on = 1;
-        return;
-    }
-
+    if (g_buz.mode == BUZ_OFF)       { Buzzer_Set(0); g_buz.is_on = 0; return; }
+    if (g_buz.mode == BUZ_DANGER_ON) { Buzzer_Set(1); g_buz.is_on = 1; return; }
     if (now >= g_buz.next_toggle_ms)
     {
-        if (g_buz.is_on)
-        {
-            g_buz.is_on = 0;
-            Buzzer_Set(0);
-            g_buz.next_toggle_ms = now + BEEP_OFF_MS;
-        }
-        else
-        {
-            g_buz.is_on = 1;
-            Buzzer_Set(1);
-            g_buz.next_toggle_ms = now + BEEP_ON_MS;
-        }
+        if (g_buz.is_on) { g_buz.is_on = 0; Buzzer_Set(0); g_buz.next_toggle_ms = now + BEEP_OFF_MS; }
+        else             { g_buz.is_on = 1; Buzzer_Set(1); g_buz.next_toggle_ms = now + BEEP_ON_MS;  }
     }
 }
 
@@ -235,11 +218,9 @@ static uint32_t ReadSmoke_mV(void)
     adc16_channel_config_t ch = {0};
     ch.channelNumber = ADC_CHANNEL;
     ch.enableInterruptOnConversionCompleted = false;
-
     ADC16_SetChannelConfig(ADC_BASE, ADC_GROUP, &ch);
     while (0U == (kADC16_ChannelConversionDoneFlag &
                   ADC16_GetChannelStatusFlags(ADC_BASE, ADC_GROUP))) {}
-
     uint32_t raw = ADC16_GetChannelConversionValue(ADC_BASE, ADC_GROUP);
     return (raw * ADC_VREF_MV) / ADC_MAX_COUNTS;
 }
@@ -248,13 +229,10 @@ static uint32_t ReadSmoke_mV(void)
 static void InitGPIO(void)
 {
     CLOCK_EnableClock(kCLOCK_PortC);
-
     gpio_pin_config_t out_cfg = {kGPIO_DigitalOutput, 0};
-
     PORT_SetPinMux(BUZ_PORT, BUZ_PIN, kPORT_MuxAsGpio);
     GPIO_PinInit(BUZ_GPIO, BUZ_PIN, &out_cfg);
     Buzzer_Set(0);
-
     PORT_SetPinMux(DHT_PORT, DHT_PIN, kPORT_MuxAsGpio);
     dht_input();
 }
@@ -263,15 +241,12 @@ static void InitGPIO(void)
 #define I2C_INST           I2C1
 #define I2C_CLK_EN         kCLOCK_I2c1
 #define I2C_BAUD           100000U
-
 #define I2C1_SCL_PORT      PORTC
 #define I2C1_SDA_PORT      PORTC
 #define I2C1_SCL_PIN       10U
 #define I2C1_SDA_PIN       11U
-
 #define OLED_ADDR_3C       0x3C
 #define OLED_ADDR_3D       0x3D
-
 #define SSD1306_CTRL_CMD   0x00
 #define SSD1306_CTRL_DATA  0x40
 
@@ -283,10 +258,10 @@ static status_t i2c_write_bytes(uint8_t addr7, const uint8_t *data, size_t len)
     i2c_master_transfer_t xfer;
     memset(&xfer, 0, sizeof(xfer));
     xfer.slaveAddress = addr7;
-    xfer.direction = kI2C_Write;
-    xfer.data = (uint8_t *)data;
-    xfer.dataSize = len;
-    xfer.flags = kI2C_TransferDefaultFlag;
+    xfer.direction    = kI2C_Write;
+    xfer.data         = (uint8_t *)data;
+    xfer.dataSize     = len;
+    xfer.flags        = kI2C_TransferDefaultFlag;
     return I2C_MasterTransferBlocking(I2C_INST, &xfer);
 }
 
@@ -295,10 +270,10 @@ static bool i2c_ping(uint8_t addr7)
     i2c_master_transfer_t xfer;
     memset(&xfer, 0, sizeof(xfer));
     xfer.slaveAddress = addr7;
-    xfer.direction = kI2C_Write;
-    xfer.data = NULL;
-    xfer.dataSize = 0;
-    xfer.flags = kI2C_TransferDefaultFlag;
+    xfer.direction    = kI2C_Write;
+    xfer.data         = NULL;
+    xfer.dataSize     = 0;
+    xfer.flags        = kI2C_TransferDefaultFlag;
     return (I2C_MasterTransferBlocking(I2C_INST, &xfer) == kStatus_Success);
 }
 
@@ -409,16 +384,14 @@ static void OLED_Init(void)
     CLOCK_EnableClock(kCLOCK_PortC);
     PORT_SetPinMux(I2C1_SCL_PORT, I2C1_SCL_PIN, kPORT_MuxAlt2);
     PORT_SetPinMux(I2C1_SDA_PORT, I2C1_SDA_PIN, kPORT_MuxAlt2);
-
     CLOCK_EnableClock(I2C_CLK_EN);
 
     i2c_master_config_t cfg;
     I2C_MasterGetDefaultConfig(&cfg);
     cfg.baudRate_Bps = I2C_BAUD;
-
     I2C_MasterInit(I2C_INST, &cfg, CLOCK_GetFreq(kCLOCK_BusClk));
 
-    if (i2c_ping(OLED_ADDR_3C)) g_oled_addr = OLED_ADDR_3C;
+    if (i2c_ping(OLED_ADDR_3C))      g_oled_addr = OLED_ADDR_3C;
     else if (i2c_ping(OLED_ADDR_3D)) g_oled_addr = OLED_ADDR_3D;
     else { g_oled_ready = 0; return; }
 
@@ -432,15 +405,10 @@ static void OLED_Init(void)
 static void OLED_Show(uint8_t t, uint8_t h, bool dht_ok, const char *s_txt)
 {
     if (!g_oled_ready) return;
-
-    char line1[24];
-    char line2[24];
-    char line3[24];
-
+    char line1[24], line2[24], line3[24];
     ssd1306_clear_page(0);
     ssd1306_clear_page(2);
     ssd1306_clear_page(4);
-
     if (dht_ok)
     {
         snprintf(line1, sizeof(line1), "T:%02uC            ", t);
@@ -451,9 +419,7 @@ static void OLED_Show(uint8_t t, uint8_t h, bool dht_ok, const char *s_txt)
         snprintf(line1, sizeof(line1), "T:--C            ");
         snprintf(line2, sizeof(line2), "H:--%%           ");
     }
-
     snprintf(line3, sizeof(line3), "S:%s             ", s_txt);
-
     ssd1306_print(0, 0, line1);
     ssd1306_print(2, 0, line2);
     ssd1306_print(4, 0, line3);
@@ -469,20 +435,21 @@ int main(void)
     InitADC();
     DWT_Init();
     OLED_Init();
+    WIFI_UART_Init();
 
     delay_ms(2000);
 
-    uint16_t hum_f4 = 0;
-    bool hum_init = false;
+    uint16_t hum_f4  = 0;
+    bool hum_init    = false;
 
     enum { S_NRM=0, S_WRN=1, S_DNG=2 } smoke_level = S_NRM;
 
     bool temp_warn40 = false;
     bool hum_warn80  = false;
 
-    uint8_t last_temp = 0;
-    uint8_t last_hum  = 0;
-    bool last_dht_ok  = false;
+    uint8_t last_temp   = 0;
+    uint8_t last_hum    = 0;
+    bool    last_dht_ok = false;
 
     uint32_t last_sample_ms = millis();
 
@@ -500,12 +467,12 @@ int main(void)
 
             if (smoke_level == S_NRM)
             {
-                if (smoke_mv >= SMOKE_DANGER_MV) smoke_level = S_DNG;
-                else if (smoke_mv >= SMOKE_WARN_MV) smoke_level = S_WRN;
+                if (smoke_mv >= SMOKE_DANGER_MV)     smoke_level = S_DNG;
+                else if (smoke_mv >= SMOKE_WARN_MV)  smoke_level = S_WRN;
             }
             else if (smoke_level == S_WRN)
             {
-                if (smoke_mv >= SMOKE_DANGER_MV) smoke_level = S_DNG;
+                if (smoke_mv >= SMOKE_DANGER_MV)                      smoke_level = S_DNG;
                 else if (smoke_mv < (SMOKE_WARN_MV - SMOKE_HYST_MV)) smoke_level = S_NRM;
             }
             else
@@ -513,7 +480,7 @@ int main(void)
                 if (smoke_mv < (SMOKE_DANGER_MV - SMOKE_HYST_MV))
                 {
                     if (smoke_mv >= SMOKE_WARN_MV) smoke_level = S_WRN;
-                    else smoke_level = S_NRM;
+                    else                           smoke_level = S_NRM;
                 }
             }
 
@@ -524,7 +491,7 @@ int main(void)
             delay_ms(60);
             uint8_t e2 = dht11_read(&temp2, &hum2);
 
-            if (e2 == 0) { last_temp = temp2; last_hum = hum2; ok = true; }
+            if (e2 == 0)      { last_temp = temp2; last_hum = hum2; ok = true; }
             else if (e1 == 0) { last_temp = temp1; last_hum = hum1; ok = true; }
             else ok = false;
 
@@ -536,7 +503,7 @@ int main(void)
             {
                 if (!hum_init)
                 {
-                    hum_f4 = (uint16_t)last_hum * 4U;
+                    hum_f4   = (uint16_t)last_hum * 4U;
                     hum_init = true;
                 }
                 else
@@ -546,10 +513,10 @@ int main(void)
                 hum_show = (uint8_t)(hum_f4 / 4U);
 
                 if (!temp_warn40) { if (last_temp >= TEMP_WARN1_C) temp_warn40 = true; }
-                else { if (last_temp <= (TEMP_WARN1_C - TEMP_HYST_C)) temp_warn40 = false; }
+                else              { if (last_temp <= (TEMP_WARN1_C - TEMP_HYST_C)) temp_warn40 = false; }
 
                 if (!hum_warn80) { if (hum_show >= HUM_WARN1_PCT) hum_warn80 = true; }
-                else { if (hum_show <= (HUM_WARN1_PCT - HUM_HYST_PCT)) hum_warn80 = false; }
+                else             { if (hum_show <= (HUM_WARN1_PCT - HUM_HYST_PCT)) hum_warn80 = false; }
             }
             else
             {
@@ -558,10 +525,11 @@ int main(void)
             }
 
             const char *s_txt = "NRM";
-            if (smoke_level == S_DNG) s_txt = "DNG";
+            if (smoke_level == S_DNG)      s_txt = "DNG";
             else if (smoke_level == S_WRN) s_txt = "WRN";
 
             OLED_Show(last_temp, hum_show, last_dht_ok, s_txt);
+            WIFI_UART_SendLine(last_temp, hum_show, s_txt);
 
             bool danger = false;
             bool warn   = false;
@@ -575,9 +543,9 @@ int main(void)
                 if (last_dht_ok && (temp_warn40 || hum_warn80)) warn = true;
             }
 
-            if (danger)      Buzzer_SetMode(BUZ_DANGER_ON);
-            else if (warn)   Buzzer_SetMode(BUZ_WARN_BEEP);
-            else             Buzzer_SetMode(BUZ_OFF);
+            if (danger)    Buzzer_SetMode(BUZ_DANGER_ON);
+            else if (warn) Buzzer_SetMode(BUZ_WARN_BEEP);
+            else           Buzzer_SetMode(BUZ_OFF);
         }
 
         delay_ms(10);
