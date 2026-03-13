@@ -14,6 +14,11 @@
 #include "fsl_i2c.h"
 #include "fsl_uart.h"
 
+/* ===================== Debug LED (PTC17) ===================== */
+#define DEBUG_LED_PORT     PORTC
+#define DEBUG_LED_GPIO     GPIOC
+#define DEBUG_LED_PIN      17U
+
 /* ===================== MQ-2 ADC (PTB3) ===================== */
 #define ADC_BASE           ADC0
 #define ADC_GROUP          0U
@@ -31,6 +36,11 @@
 #define BUZ_GPIO           GPIOC
 #define BUZ_PIN            8U
 
+/* ===================== WATER PUMP (PTD2) ===================== */
+#define PUMP_PORT          PORTD
+#define PUMP_GPIO          GPIOD
+#define PUMP_PIN           2U
+
 /* ===================== ESP8266 UART1 (PTC4=TX, PTC3=RX) ===================== */
 #define WIFI_UART          UART1
 #define WIFI_UART_CLK      kCLOCK_Uart1
@@ -40,8 +50,8 @@
 #define WIFI_UART_BAUD     9600U
 
 /* ===================== Smoke thresholds ===================== */
-#define SMOKE_WARN_MV      1000U
-#define SMOKE_DANGER_MV    1600U
+#define SMOKE_WARN_MV      1600U
+#define SMOKE_DANGER_MV    2000U
 #define SMOKE_HYST_MV      50U
 
 /* ===================== Temp/Hum thresholds ===================== */
@@ -51,11 +61,25 @@
 #define TEMP_HYST_C        1U
 #define HUM_HYST_PCT       2U
 
+/* ===================== Pump thresholds ===================== */
+#define PUMP_ON_TEMP_C     26U   /* lowered for testing — change back to 60 for production */
+#define PUMP_OFF_TEMP_C    25U   /* 2°C hysteresis — change back to 55 for production */
+
 /* ===================== Buzzer beep pattern ===================== */
 #define BEEP_ON_MS         80U
 #define BEEP_OFF_MS        420U
 
+/* ===================== Windows-specific delays ===================== */
+#define WINDOWS_I2C_DELAY_MS    200
+#define WINDOWS_INIT_DELAY_MS   500
+
 /* ===================== DWT Timing ===================== */
+
+/*
+ * FIX #1: DWT_Init() must be called as the very first thing in main(),
+ * before ANY delay_ms() calls. Your friend moved it after InitGPIO()
+ * and InitADC(), so all early delays were zero — breaking OLED init.
+ */
 static void DWT_Init(void)
 {
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -82,6 +106,28 @@ static uint32_t millis(void)
     return DWT_GetCycles() / (SystemCoreClock / 1000U);
 }
 
+/* ===================== Debug LED ===================== */
+static void DebugLED_Init(void)
+{
+    CLOCK_EnableClock(kCLOCK_PortC);
+    gpio_pin_config_t led_config = {kGPIO_DigitalOutput, 0};
+    PORT_SetPinMux(DEBUG_LED_PORT, DEBUG_LED_PIN, kPORT_MuxAsGpio);
+    GPIO_PinInit(DEBUG_LED_GPIO, DEBUG_LED_PIN, &led_config);
+    GPIO_PortClear(DEBUG_LED_GPIO, 1U << DEBUG_LED_PIN);
+}
+
+static void DebugLED_On(void)  { GPIO_PortSet(DEBUG_LED_GPIO,    1U << DEBUG_LED_PIN); }
+static void DebugLED_Off(void) { GPIO_PortClear(DEBUG_LED_GPIO,  1U << DEBUG_LED_PIN); }
+static void DebugLED_Toggle(void) { GPIO_PortToggle(DEBUG_LED_GPIO, 1U << DEBUG_LED_PIN); }
+
+static void DebugLED_Blink(uint32_t times, uint32_t delay)
+{
+    for (uint32_t i = 0; i < times; i++) {
+        DebugLED_On();  delay_ms(delay);
+        DebugLED_Off(); delay_ms(delay);
+    }
+}
+
 /* ===================== ESP8266 UART ===================== */
 static void WIFI_UART_Init(void)
 {
@@ -95,9 +141,9 @@ static void WIFI_UART_Init(void)
     cfg.baudRate_Bps = WIFI_UART_BAUD;
     cfg.enableTx = true;
     cfg.enableRx = true;
-
-    /* Try 30MHz - half of 60MHz bus clock */
     UART_Init(WIFI_UART, &cfg, 180000000U);
+
+    delay_ms(100);  /* restored — friend removed this */
 }
 
 static void WIFI_UART_SendLine(uint8_t t, uint8_t h, const char *s_txt)
@@ -179,8 +225,7 @@ static buzzer_sm_t g_buz = {BUZ_OFF, 0, 0};
 
 static void Buzzer_SetMode(buz_mode_t m)
 {
-    if (g_buz.mode != m)
-    {
+    if (g_buz.mode != m) {
         g_buz.mode = m;
         g_buz.is_on = 0;
         g_buz.next_toggle_ms = millis();
@@ -193,11 +238,17 @@ static void Buzzer_Tick(void)
     uint32_t now = millis();
     if (g_buz.mode == BUZ_OFF)       { Buzzer_Set(0); g_buz.is_on = 0; return; }
     if (g_buz.mode == BUZ_DANGER_ON) { Buzzer_Set(1); g_buz.is_on = 1; return; }
-    if (now >= g_buz.next_toggle_ms)
-    {
+    if (now >= g_buz.next_toggle_ms) {
         if (g_buz.is_on) { g_buz.is_on = 0; Buzzer_Set(0); g_buz.next_toggle_ms = now + BEEP_OFF_MS; }
         else             { g_buz.is_on = 1; Buzzer_Set(1); g_buz.next_toggle_ms = now + BEEP_ON_MS;  }
     }
+}
+
+/* ===================== Pump ===================== */
+static void Pump_Set(bool on)
+{
+    if (on) GPIO_PortSet(PUMP_GPIO, 1U << PUMP_PIN);
+    else    GPIO_PortClear(PUMP_GPIO, 1U << PUMP_PIN);
 }
 
 /* ===================== ADC ===================== */
@@ -229,12 +280,22 @@ static uint32_t ReadSmoke_mV(void)
 static void InitGPIO(void)
 {
     CLOCK_EnableClock(kCLOCK_PortC);
+    CLOCK_EnableClock(kCLOCK_PortD);
+
     gpio_pin_config_t out_cfg = {kGPIO_DigitalOutput, 0};
+
     PORT_SetPinMux(BUZ_PORT, BUZ_PIN, kPORT_MuxAsGpio);
     GPIO_PinInit(BUZ_GPIO, BUZ_PIN, &out_cfg);
     Buzzer_Set(0);
+
     PORT_SetPinMux(DHT_PORT, DHT_PIN, kPORT_MuxAsGpio);
     dht_input();
+
+    PORT_SetPinMux(PUMP_PORT, PUMP_PIN, kPORT_MuxAsGpio);
+    GPIO_PinInit(PUMP_GPIO, PUMP_PIN, &out_cfg);
+    Pump_Set(false);
+
+    delay_ms(50);
 }
 
 /* ===================== OLED SSD1306 I2C1 ===================== */
@@ -295,8 +356,7 @@ static void ssd1306_cmd_list(const uint8_t *cmds, size_t n)
 static void ssd1306_data(const uint8_t *d, size_t n)
 {
     uint8_t buf[17];
-    while (n)
-    {
+    while (n) {
         size_t chunk = (n > 16) ? 16 : n;
         buf[0] = SSD1306_CTRL_DATA;
         memcpy(&buf[1], d, chunk);
@@ -370,8 +430,7 @@ static const uint8_t* glyph(char c)
 static void ssd1306_print(uint8_t page, uint8_t col, const char *s)
 {
     ssd1306_set_cursor(page, col);
-    while (*s)
-    {
+    while (*s) {
         const uint8_t *g = glyph(*s++);
         ssd1306_data(g, 5);
         uint8_t gap = 0x00;
@@ -379,65 +438,162 @@ static void ssd1306_print(uint8_t page, uint8_t col, const char *s)
     }
 }
 
-static void OLED_Init(void)
+/*
+ * FIX #2: Restored full I2C pin config with open-drain + pull-ups.
+ * Your friend replaced this with a bare PORT_SetPinMux which omits
+ * open-drain — mandatory for I2C. Without it the bus fights itself
+ * and the OLED never responds.
+ */
+static void I2C_ConfigurePins(void)
 {
     CLOCK_EnableClock(kCLOCK_PortC);
-    PORT_SetPinMux(I2C1_SCL_PORT, I2C1_SCL_PIN, kPORT_MuxAlt2);
-    PORT_SetPinMux(I2C1_SDA_PORT, I2C1_SDA_PIN, kPORT_MuxAlt2);
+
+    port_pin_config_t i2c_pin_config = {
+        kPORT_PullUp,
+        kPORT_SlowSlewRate,
+        kPORT_PassiveFilterDisable,
+        kPORT_OpenDrainEnable,        /* CRITICAL: I2C requires open-drain */
+        kPORT_LowDriveStrength,
+        kPORT_MuxAlt2,
+        kPORT_UnlockRegister
+    };
+
+    PORT_SetPinConfig(I2C1_SCL_PORT, I2C1_SCL_PIN, &i2c_pin_config);
+    PORT_SetPinConfig(I2C1_SDA_PORT, I2C1_SDA_PIN, &i2c_pin_config);
+
+    delay_ms(10);
+}
+
+static void OLED_Init(void)
+{
+    DebugLED_On();
+
+    I2C_ConfigurePins();
+    delay_ms(WINDOWS_I2C_DELAY_MS);
+
     CLOCK_EnableClock(I2C_CLK_EN);
+    delay_ms(10);
 
-    i2c_master_config_t cfg;
-    I2C_MasterGetDefaultConfig(&cfg);
-    cfg.baudRate_Bps = I2C_BAUD;
-    I2C_MasterInit(I2C_INST, &cfg, CLOCK_GetFreq(kCLOCK_BusClk));
+    /* Try multiple baud rates — start slow for reliability */
+    uint32_t baud_rates[] = {100000, 50000, 10000};
+    bool found = false;
 
-    if (i2c_ping(OLED_ADDR_3C))      g_oled_addr = OLED_ADDR_3C;
-    else if (i2c_ping(OLED_ADDR_3D)) g_oled_addr = OLED_ADDR_3D;
-    else { g_oled_ready = 0; return; }
+    for (int i = 0; i < 3 && !found; i++) {
+        i2c_master_config_t cfg;
+        I2C_MasterGetDefaultConfig(&cfg);
+        cfg.baudRate_Bps = baud_rates[i];
+        I2C_MasterInit(I2C_INST, &cfg, CLOCK_GetFreq(kCLOCK_BusClk));
+        delay_ms(50);
+
+        if (i2c_ping(OLED_ADDR_3C))      { g_oled_addr = OLED_ADDR_3C; found = true; DebugLED_Blink(2, 100); }
+        else if (i2c_ping(OLED_ADDR_3D)) { g_oled_addr = OLED_ADDR_3D; found = true; DebugLED_Blink(3, 100); }
+
+        if (!found) {
+            /* Bus may be locked — clock out stuck slave with 9 SCL pulses */
+            I2C_MasterDeinit(I2C_INST);
+            delay_ms(10);
+
+            PORT_SetPinMux(I2C1_SCL_PORT, I2C1_SCL_PIN, kPORT_MuxAsGpio);
+            gpio_pin_config_t scl_gpio = {kGPIO_DigitalOutput, 1};
+            GPIO_PinInit(GPIOC, I2C1_SCL_PIN, &scl_gpio);
+
+            for (int pulse = 0; pulse < 9; pulse++) {
+                GPIO_PortClear(GPIOC, 1U << I2C1_SCL_PIN); delay_us(5);
+                GPIO_PortSet(GPIOC,   1U << I2C1_SCL_PIN); delay_us(5);
+            }
+
+            PORT_SetPinConfig(I2C1_SCL_PORT, I2C1_SCL_PIN,
+                &(port_pin_config_t){
+                    kPORT_PullUp, kPORT_SlowSlewRate,
+                    kPORT_PassiveFilterDisable, kPORT_OpenDrainEnable,
+                    kPORT_LowDriveStrength, kPORT_MuxAlt2, kPORT_UnlockRegister
+                });
+            delay_ms(10);
+        }
+    }
+
+    if (!found) { g_oled_ready = 0; DebugLED_Off(); return; }
+
+    g_oled_ready = 1;
+    delay_ms(WINDOWS_I2C_DELAY_MS);
 
     ssd1306_init();
+    delay_ms(100);
+
     ssd1306_clear_page(0);
     ssd1306_clear_page(2);
     ssd1306_clear_page(4);
-    g_oled_ready = 1;
+
+    ssd1306_print(0, 0, "System Init OK");
+    ssd1306_print(2, 0, "Ready");
+
+    DebugLED_Off();
 }
 
 static void OLED_Show(uint8_t t, uint8_t h, bool dht_ok, const char *s_txt)
 {
     if (!g_oled_ready) return;
+
+    static uint32_t last_update = 0;
+    uint32_t now = millis();
+    if (now - last_update < 100) return;
+    last_update = now;
+
     char line1[24], line2[24], line3[24];
     ssd1306_clear_page(0);
     ssd1306_clear_page(2);
     ssd1306_clear_page(4);
-    if (dht_ok)
-    {
+
+    if (dht_ok) {
         snprintf(line1, sizeof(line1), "T:%02uC            ", t);
         snprintf(line2, sizeof(line2), "H:%02u%%           ", h);
-    }
-    else
-    {
+    } else {
         snprintf(line1, sizeof(line1), "T:--C            ");
         snprintf(line2, sizeof(line2), "H:--%%           ");
     }
     snprintf(line3, sizeof(line3), "S:%s             ", s_txt);
+
     ssd1306_print(0, 0, line1);
     ssd1306_print(2, 0, line2);
     ssd1306_print(4, 0, line3);
+
+    DebugLED_Toggle();
 }
 
 /* ===================== Main ===================== */
 int main(void)
 {
+    /*
+     * FIX #1 APPLIED: DWT_Init() is first — before any delay_ms().
+     * Your friend put it after InitGPIO/InitADC, so all early delays
+     * were zero, starving the OLED of its required startup time.
+     */
+    DWT_Init();
+
+    delay_ms(WINDOWS_INIT_DELAY_MS);
+
     BOARD_InitBootPins();
     BOARD_InitBootClocks();
 
+    /* Re-init DWT after clock config in case SystemCoreClock changed */
+    DWT_Init();
+
+    DebugLED_Init();
+    DebugLED_Blink(1, 500);
+
     InitGPIO();
     InitADC();
-    DWT_Init();
+
+    delay_ms(WINDOWS_INIT_DELAY_MS);
+
     OLED_Init();
+
+    delay_ms(WINDOWS_INIT_DELAY_MS);
+
     WIFI_UART_Init();
 
     delay_ms(2000);
+    DebugLED_Blink(2, 200);
 
     uint16_t hum_f4  = 0;
     bool hum_init    = false;
@@ -446,12 +602,14 @@ int main(void)
 
     bool temp_warn40 = false;
     bool hum_warn80  = false;
+    bool pump_on     = false;
 
     uint8_t last_temp   = 0;
     uint8_t last_hum    = 0;
     bool    last_dht_ok = false;
 
     uint32_t last_sample_ms = millis();
+    uint32_t last_heartbeat = millis();
 
     for (;;)
     {
@@ -459,26 +617,25 @@ int main(void)
 
         uint32_t now = millis();
 
+        if (now - last_heartbeat >= 2000) {
+            last_heartbeat = now;
+            DebugLED_Blink(1, 50);
+        }
+
         if ((now - last_sample_ms) >= 1000U)
         {
             last_sample_ms = now;
 
             uint32_t smoke_mv = ReadSmoke_mV();
 
-            if (smoke_level == S_NRM)
-            {
-                if (smoke_mv >= SMOKE_DANGER_MV)     smoke_level = S_DNG;
-                else if (smoke_mv >= SMOKE_WARN_MV)  smoke_level = S_WRN;
-            }
-            else if (smoke_level == S_WRN)
-            {
+            if (smoke_level == S_NRM) {
+                if (smoke_mv >= SMOKE_DANGER_MV)    smoke_level = S_DNG;
+                else if (smoke_mv >= SMOKE_WARN_MV) smoke_level = S_WRN;
+            } else if (smoke_level == S_WRN) {
                 if (smoke_mv >= SMOKE_DANGER_MV)                      smoke_level = S_DNG;
                 else if (smoke_mv < (SMOKE_WARN_MV - SMOKE_HYST_MV)) smoke_level = S_NRM;
-            }
-            else
-            {
-                if (smoke_mv < (SMOKE_DANGER_MV - SMOKE_HYST_MV))
-                {
+            } else {
+                if (smoke_mv < (SMOKE_DANGER_MV - SMOKE_HYST_MV)) {
                     if (smoke_mv >= SMOKE_WARN_MV) smoke_level = S_WRN;
                     else                           smoke_level = S_NRM;
                 }
@@ -501,13 +658,10 @@ int main(void)
 
             if (ok)
             {
-                if (!hum_init)
-                {
+                if (!hum_init) {
                     hum_f4   = (uint16_t)last_hum * 4U;
                     hum_init = true;
-                }
-                else
-                {
+                } else {
                     hum_f4 = (uint16_t)((3U * hum_f4 + (uint16_t)last_hum * 4U) / 4U);
                 }
                 hum_show = (uint8_t)(hum_f4 / 4U);
@@ -517,11 +671,20 @@ int main(void)
 
                 if (!hum_warn80) { if (hum_show >= HUM_WARN1_PCT) hum_warn80 = true; }
                 else             { if (hum_show <= (HUM_WARN1_PCT - HUM_HYST_PCT)) hum_warn80 = false; }
+
+                /* Pump control with hysteresis */
+                if (!pump_on) {
+                    if (last_temp >= PUMP_ON_TEMP_C) { pump_on = true;  Pump_Set(true);  }
+                } else {
+                    if (last_temp <= PUMP_OFF_TEMP_C) { pump_on = false; Pump_Set(false); }
+                }
             }
             else
             {
                 temp_warn40 = false;
                 hum_warn80  = false;
+                pump_on     = false;
+                Pump_Set(false);
             }
 
             const char *s_txt = "NRM";
@@ -537,8 +700,7 @@ int main(void)
             if (smoke_level == S_DNG) danger = true;
             if (last_dht_ok && last_temp >= TEMP_DANGER_C) danger = true;
 
-            if (!danger)
-            {
+            if (!danger) {
                 if (smoke_level == S_WRN) warn = true;
                 if (last_dht_ok && (temp_warn40 || hum_warn80)) warn = true;
             }
