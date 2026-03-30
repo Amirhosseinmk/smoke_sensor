@@ -1,50 +1,107 @@
+/*
+ * =============================================================================
+ * FILE:    esp8266.ino
+ * PROJECT: SEP600 – Environmental Safety Monitor for Vulnerable Individuals
+ * COURSE:  SEP600, Seneca Polytechnic, Winter 2026
+ * TEAM:    Amirhossein Khonsari, Cody
+ *
+ * DESCRIPTION:
+ *   ESP8266 co-processor firmware. Receives JSON telemetry from the K66F over
+ *   UART at 9600 baud, parses all sensor fields, performs motion classification
+ *   (tilt, shock, vibration) on the accelerometer data, and serves a live web
+ *   dashboard over Wi-Fi at 192.168.4.1.
+ *
+ * RESPONSIBILITIES:
+ *   - Parse incoming JSON from K66F (UART, swapped pins)
+ *   - Maintain a 200-row circular CSV log buffer in RAM
+ *   - Serve responsive HTML dashboard with live sensor cards
+ *   - Expose /api JSON endpoint for future integrations
+ *   - Log RCWL-0516 radar presence edge events (up to 20)
+ *   - Log accelerometer motion events (up to 8)
+ *   - Provide /log.csv download and /clearlog endpoints
+ *
+ * NETWORK:
+ *   Mode: Wi-Fi Access Point (no internet required)
+ *   SSID: K66_SENSORS  Password: 12345678
+ *   Dashboard: http://192.168.4.1/
+ *
+ * AI DECLARATION:
+ *   All inline comments and the file header in this file were written with
+ *   assistance from Claude (Anthropic) for documentation and grammar purposes.
+ *   Some parsing logic, dashboard HTML/CSS/JS, circular buffer design, motion
+ *   classification algorithm, radar edge detection, and server routing were
+ *   designed and implemement by AI.
+ * =============================================================================
+ */
+
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ctype.h>
 
 ESP8266WebServer server(80);
 
-/* ── Live sensor globals ─────────────────────────────────────────────────── */
+/* =============================================================================
+   Section 1: Live Sensor Globals 
+   Updated every time a complete JSON line is received from the K66F.
+   ============================================================================= */
+
 int T=0,H=0,S_code=0,F_val=0,IR=0,DT=0,DS=0,MT=0,MS=0,XS=0,RADAR=0;
 int AX=0,AY=0,AZ=0,MOT=0,TILT=0,SHOCK=0,VIB=0;
-unsigned long TS=0;
-String AQ_STR="GOOD";
-String bufLine="";
+unsigned long TS=0;   /* Uptime in seconds, from K66F ts field */
+String AQ_STR="GOOD"; /* Air quality label: GOOD / FAIR / POOR / BAD */
+String bufLine="";    /* UART line accumulation buffer */
 
-/* ── Radar presence log (last 20 events) ─────────────────────────────────── */
+/* =============================================================================
+   Section 2: Radar Presence Event Log --- Generated with help of AI
+   Tracks rising and falling edges on the RCWL-0516 output.
+   Only state *changes* are logged — consecutive identical states are ignored.
+   Stores the last 20 events in a simple array (oldest overwritten first).
+   ============================================================================= */
+
 struct RadarEvent { unsigned long t; int state; }; /* state: 1=detected, 0=cleared */
 RadarEvent radarLog[20];
 int radarLogCount = 0;
-int prevRADAR     = -1;   /* -1 = uninitialised, tracks edge detection */
+int prevRADAR     = -1; /* -1 = uninitialised; ensures first reading always logged */
 
-/* ── Motion log (last 8 events) ─────────────────────────────────────────── */
-struct MotionLogEntry { unsigned long t; int e; };
+/* =============================================================================
+   Section 3: Motion Event Log 
+   Populated by computeMotion() when the ESP-side classifier detects a new
+   tilt, shock, or vibration event. Stores the last 8 events.
+   ============================================================================= */
+
+struct MotionLogEntry { unsigned long t; int e; }; /* e: bitmask (1=tilt,2=shock,4=vib) */
 MotionLogEntry motionLog[8];
 int motionLogCount=0;
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   CSV circular log  – 200 rows
-   ═══════════════════════════════════════════════════════════════════════════ */
+/* =============================================================================
+   Section 4: CSV Circular Log Buffer -- Genersated with help of AI
+   Stores the last 200 sensor readings in a circular (ring) buffer.
+   When full, the oldest entry is overwritten (csvHead advances).
+   All fields including radar presence are included for export.
+   ============================================================================= */
+
 #define CSV_LOG_SIZE 200
 
 struct LogRow {
     unsigned long ts;
-    int8_t   T, H;
-    uint8_t  S_code, flame;
-    int16_t  IR;
-    int16_t  AX, AY, AZ;
-    char     AQ[5];
-    uint8_t  tilt_active, shock_active, vib_active, mot;
-    uint16_t tilt_count, shock_count, vib_count;
-    uint8_t  radar;   /* NEW: 1 = presence detected, 0 = clear */
+    int8_t   T, H;           /* Temperature (°C) and humidity (%)            */
+    uint8_t  S_code, flame;  /* Smoke code (0/1/2) and flame flag (0/1)      */
+    int16_t  IR;             /* IR temperature in tenths of °C               */
+    int16_t  AX, AY, AZ;    /* Accelerometer axes in milli-g                */
+    char     AQ[5];          /* Air quality label (null-terminated)          */
+    uint8_t  tilt_active, shock_active, vib_active, mot; /* Motion flags     */
+    uint16_t tilt_count, shock_count, vib_count;         /* Cumulative counts*/
+    uint8_t  radar;          /* 1 = presence detected, 0 = clear             */
 };
 
 static LogRow csvBuf[CSV_LOG_SIZE];
-static int    csvHead  = 0;
-static int    csvCount = 0;
+static int    csvHead  = 0; /* Index of oldest entry (read from here)        */
+static int    csvCount = 0; /* Number of valid entries (0 to CSV_LOG_SIZE)   */
 
+/* Append current sensor state as a new row to the circular buffer */
 static void csvAppend(){
     int idx = (csvHead + csvCount) % CSV_LOG_SIZE;
+    /* If buffer is full, advance head to drop the oldest entry */
     if(csvCount == CSV_LOG_SIZE) csvHead = (csvHead + 1) % CSV_LOG_SIZE;
     else csvCount++;
     LogRow &r = csvBuf[idx];
@@ -65,10 +122,16 @@ static void csvAppend(){
     r.tilt_count   = (uint16_t)TILT;
     r.shock_count  = (uint16_t)SHOCK;
     r.vib_count    = (uint16_t)VIB;
-    r.radar        = (uint8_t)(RADAR ? 1 : 0);   /* NEW */
+    r.radar        = (uint8_t)(RADAR ? 1 : 0);
 }
 
-/* ── JSON parsing helpers ─────────────────────────────────────────────────── */
+/* =============================================================================
+   Section 5: JSON Parsing Helpers -- generated partially by AI 
+   Lightweight string-based JSON parsing without an external library.
+   Searches for "key": pattern and extracts integer or quoted string value.
+   ============================================================================= */
+
+/* Extract integer value for given key from JSON string */
 static int parseJsonInt(const String &json, const char *key){
     String search="\""; search+=key; search+="\":";
     int idx=json.indexOf(search); if(idx<0) return 0;
@@ -79,6 +142,8 @@ static int parseJsonInt(const String &json, const char *key){
     while(idx<(int)json.length() && isDigit(json[idx])) num+=json[idx++];
     return num.toInt();
 }
+
+/* Extract quoted string value for given key from JSON string */
 static String parseJsonStr(const String &json, const char *key){
     String search="\""; search+=key; search+="\":\"";
     int idx=json.indexOf(search); if(idx<0) return "";
@@ -86,6 +151,8 @@ static String parseJsonStr(const String &json, const char *key){
     while(idx<(int)json.length() && json[idx] != '"') val+=json[idx++];
     return val;
 }
+
+/* Parse the MLOG array from JSON — used for motion event replay after reconnect */
 static void parseMotionLog(const String &json){
     motionLogCount=0;
     int keyIdx=json.indexOf("\"MLOG\":"); if(keyIdx<0) return;
@@ -101,13 +168,15 @@ static void parseMotionLog(const String &json){
         motionLogCount++; pos=objEnd+1;
     }
 }
+
+/* Convert motion event bitmask to human-readable type name */
 static const char* motionTypeName(int e){
     if(e&1) return "TILT"; if(e&2) return "SHOCK"; if(e&4) return "VIB"; return "UNKNOWN";
 }
 
 /*
- * Log a radar edge event (HIGH or LOW transition).
- * Called whenever RADAR changes state so the log shows arrivals and departures.
+ * Log a radar edge event (state change only).
+ * Uses a simple overwrite-oldest strategy when the 20-entry log is full.
  */
 static void addRadarEvent(int state){
     if(radarLogCount < 20){
@@ -115,13 +184,18 @@ static void addRadarEvent(int state){
         radarLog[radarLogCount].state = state;
         radarLogCount++;
     } else {
+        /* Shift entries left and append at end */
         for(int i=0;i<19;i++) radarLog[i]=radarLog[i+1];
         radarLog[19].t = TS; radarLog[19].state = state;
     }
 }
 
+/*
+ * Parse a complete JSON line from the K66F.
+ * Extracts all sensor fields, detects radar state changes, and triggers logging.
+ */
 static void parseLine(const String &line){
-    if(line.indexOf('{')<0) return;
+    if(line.indexOf('{')<0) return; /* Skip malformed / incomplete lines */
     T=parseJsonInt(line,"T"); H=parseJsonInt(line,"H"); S_code=parseJsonInt(line,"S");
     F_val=parseJsonInt(line,"F"); IR=parseJsonInt(line,"IR"); DT=parseJsonInt(line,"DT");
     DS=parseJsonInt(line,"DS"); MT=parseJsonInt(line,"MT"); MS=parseJsonInt(line,"MS");
@@ -133,25 +207,43 @@ static void parseLine(const String &line){
     AQ_STR=parseJsonStr(line,"AQ"); if(AQ_STR.length()==0) AQ_STR="GOOD";
     parseMotionLog(line);
 
-    /* Detect radar state change and log the edge */
+    /* Edge detection: only log when RADAR changes state (not on every sample) */
     if(prevRADAR != RADAR){
         addRadarEvent(RADAR);
         prevRADAR = RADAR;
     }
 }
 
-/* ── Display helpers ──────────────────────────────────────────────────────── */
+/* =============================================================================
+   Section 6: Display Helper Functions
+   ============================================================================= */
+
+/* Convert milli-g to g with 3 decimal places (absolute value) */
 static String mgToG(int val){ if(val<0) val=-val; return String(val/1000.0f,3); }
+
+/* Format IR temperature as string; returns "--" when sensor offline */
 static String irDisplay(){ if(IR<-3000) return "--"; return String(IR/10.0f,1); }
 
-/* ── Motion detection (ESP-side) ─────────────────────────────────────────── */
+/* =============================================================================
+   Section 7: Motion Classification (ESP-side)
+   Computes tilt, shock, and vibration from accelerometer delta values.
+   Running on the ESP8266 rather than K66F offloads computation and keeps
+   JSON payload small (raw XYZ only; classification happens here).
+
+   Thresholds:
+     TILT:  |AX| or |AY| > 300 mg  (device tilted > ~17°)
+     VIB:   frame delta > 120 mg   (light vibration)
+     SHOCK: frame delta > 600 mg   (hard impact)
+   ============================================================================= */
+
 #define TILT_THRESH_MG   300
 #define VIB_THRESH_MG    120
 #define SHOCK_THRESH_MG  600
 
 static int  prevAX=0, prevAY=0, prevAZ=0;
-static bool motionReady=false;
+static bool motionReady=false; /* false until first reading received */
 
+/* Append a motion event to the log, overwriting oldest when full */
 static void addMotionLogEntry(int eventBits){
     if(motionLogCount<8){
         motionLog[motionLogCount].t=TS; motionLog[motionLogCount].e=eventBits; motionLogCount++;
@@ -160,6 +252,13 @@ static void addMotionLogEntry(int eventBits){
         motionLog[7].t=TS; motionLog[7].e=eventBits;
     }
 }
+
+/*
+ * Compute motion events from latest accelerometer reading.
+ * Called after every parseLine() to keep motion state current.
+ * Tilt: based on absolute axis values (static orientation).
+ * Shock/Vibration: based on frame-to-frame delta (dynamic movement).
+ */
 static void computeMotion(){
     int dX=AX-prevAX,dY=AY-prevAY,dZ=AZ-prevAZ;
     if(dX<0)dX=-dX;if(dY<0)dY=-dY;if(dZ<0)dZ=-dZ;
@@ -169,6 +268,7 @@ static void computeMotion(){
     bool isShock=motionReady&&(maxDelta>SHOCK_THRESH_MG);
     bool isVib=motionReady&&!isShock&&(maxDelta>VIB_THRESH_MG);
     int newMOT=0,logBits=0;
+    /* Only increment counter and log on rising edge (new event, not sustained) */
     if(isTilt){newMOT|=1;if(!(MOT&1)){TILT++;logBits|=1;}}
     if(isShock){newMOT|=2;if(!(MOT&2)){SHOCK++;logBits|=2;}}
     if(isVib){newMOT|=4;if(!(MOT&4)){VIB++;logBits|=4;}}
@@ -176,12 +276,23 @@ static void computeMotion(){
     MOT=newMOT; prevAX=AX;prevAY=AY;prevAZ=AZ; motionReady=true;
 }
 
-/* ── Smoke / badge helpers ────────────────────────────────────────────────── */
+/* =============================================================================
+   Section 8: HTML Dashboard Helpers -- generated with help of ai
+   Helper functions that generate HTML fragments for dynamic content.
+   ============================================================================= */
+
+/* Map smoke code (0/1/2) to human-readable label */
 static String smokeLabel(){ if(S_code==0)return "NORMAL";if(S_code==1)return "WARNING";return "DANGER";}
+
+/* Map smoke code to colour (green / amber / red) */
 static String smokeColor(){ if(S_code==0)return "#27ae60";if(S_code==1)return "#f39c12";return "#e74c3c";}
+
+/* Render a motion detection badge (coloured when active, green when clear) */
 static String motionBadge(bool active,const String &onColor){
     return String("<span class='badge' style='color:")+(active?onColor:"#27ae60")+"'>"+(active?"DETECTED":"NONE")+"</span>";
 }
+
+/* Generate HTML for the recent motion events card */
 static String motionLogHtml(){
     String s="";
     if(motionLogCount==0){
@@ -190,6 +301,7 @@ static String motionLogHtml(){
         return s;
     }
     s+="<div class='card wide'><div class='card-label'>Recent Motion Events</div>";
+    /* Display in reverse-chronological order (newest first) */
     for(int i=motionLogCount-1;i>=0;i--){
         s+="<div style='margin-top:6px;font-family:monospace;font-size:14px;color:#64b5f6;'>";
         s+=String(motionLog[i].t);s+="s &mdash; ";s+=motionTypeName(motionLog[i].e);
@@ -198,16 +310,14 @@ static String motionLogHtml(){
     s+="</div>";return s;
 }
 
-/*
- * Human presence log HTML – shows last 20 radar edge events
- * in reverse chronological order (most recent at top).
- */
+/* Generate HTML for the human presence (radar) event log card */
 static String radarLogHtml(){
     String s="<div class='card wide'><div class='card-label'>Human Presence Log (last 20 events)</div>";
     if(radarLogCount==0){
         s+="<div class='feat-value' style='font-size:16px;color:#8b949e'>No events yet</div></div>";
         return s;
     }
+    /* Display in reverse-chronological order (newest first) */
     for(int i=radarLogCount-1;i>=0;i--){
         const char *label = radarLog[i].state ? "DETECTED" : "CLEARED";
         const char *color = radarLog[i].state ? "#e74c3c"  : "#27ae60";
@@ -219,13 +329,20 @@ static String radarLogHtml(){
     s+="</div>";return s;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   HTTP handlers
-   ═══════════════════════════════════════════════════════════════════════════ */
+/* =============================================================================
+   Section 9: HTTP Route Handlers -- generated with AI
+   ============================================================================= */
 
+/*
+ * GET /
+ * Serves the main HTML dashboard. Auto-refreshes every 2 seconds via
+ * <meta http-equiv='refresh' content='2'>.
+ * Sections: Human Presence, Core Sensors, Motion Status, Accelerometer,
+ *           Uptime, CSV Log controls, Presence Log, Motion Event Log.
+ */
 void handleRoot(){
     String logStatus = String(csvCount) + " / " + String(CSV_LOG_SIZE) + " rows";
-    String radarColor  = RADAR ? "#e74c3c" : "#27ae60";
+    String radarColor  = RADAR ? "#e74c3c" : "#27ae60"; /* Red = detected, green = clear */
     String radarLabel  = RADAR ? "DETECTED" : "CLEAR";
 
     String html = R"HTML(<!DOCTYPE html><html><head>
@@ -254,6 +371,7 @@ h1{margin:0 0 4px 0;font-size:24px}
 .btn-dl{background:#238636;color:#fff}.btn-dl:hover{background:#2ea043}
 .btn-cl{background:#6e1a1a;color:#fff}.btn-cl:hover{background:#b22222}
 .log-info{color:#8b949e;font-size:13px}
+/* Pulsing animation for active radar detection */
 .radar-pulse{animation:pulse 1.2s infinite}
 @keyframes pulse{0%{opacity:1}50%{opacity:0.4}100%{opacity:1}}
 </style>
@@ -343,14 +461,20 @@ h1{margin:0 0 4px 0;font-size:24px}
     server.send(200,"text/html",html);
 }
 
-/* ── /log.csv ────────────────────────────────────────────────────────────── */
+/*
+ * GET /log.csv
+ * Streams the circular CSV buffer as a downloadable file.
+ * Uses chunked transfer to avoid allocating one large String in RAM.
+ * Columns: uptime, temp, humidity, smoke, flame, IR temp,
+ *          accelerometer XYZ, air quality, motion flags/counts, radar.
+ */
 void handleCSV(){
     server.sendHeader("Content-Disposition","attachment; filename=\"k66_log.csv\"");
     server.sendHeader("Cache-Control","no-store");
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200,"text/csv","");
 
-    /* Header row – radar column added at the end */
+    /* Send CSV header row */
     server.sendContent(
         "uptime_s,"
         "temp_C,humidity_pct,"
@@ -362,13 +486,15 @@ void handleCSV(){
         "tilt_active,shock_active,vib_active,"
         "motion_bitmask,"
         "tilt_count,shock_count,vib_count,"
-        "radar_presence\r\n"          /* NEW column */
+        "radar_presence\r\n"
     );
 
+    /* Stream data rows from circular buffer in chronological order */
     for(int i=0;i<csvCount;i++){
         const LogRow &r=csvBuf[(csvHead+i)%CSV_LOG_SIZE];
         const char *smokeStr=(r.S_code==0)?"NORMAL":(r.S_code==1)?"WARNING":"DANGER";
         char irBuf[10];
+        /* Format IR as float, or "--" if sensor was offline */
         if(r.IR<-3000) snprintf(irBuf,sizeof(irBuf),"--");
         else           snprintf(irBuf,sizeof(irBuf),"%.1f",r.IR/10.0f);
         char row[180];
@@ -383,7 +509,7 @@ void handleCSV(){
             "%u,%u,%u,"
             "%u,"
             "%u,%u,%u,"
-            "%u\r\n",           /* NEW: radar */
+            "%u\r\n",
             r.ts,
             (int)r.T,(int)r.H,
             (unsigned)r.S_code,smokeStr,
@@ -394,27 +520,36 @@ void handleCSV(){
             (unsigned)r.tilt_active,(unsigned)r.shock_active,(unsigned)r.vib_active,
             (unsigned)r.mot,
             (unsigned)r.tilt_count,(unsigned)r.shock_count,(unsigned)r.vib_count,
-            (unsigned)r.radar       /* NEW */
+            (unsigned)r.radar
         );
         server.sendContent(row);
-        yield();
+        yield(); /* Feed the ESP8266 watchdog between rows */
     }
-    server.sendContent("");
+    server.sendContent(""); /* Signal end of chunked response */
 }
 
-/* ── /clearlog ───────────────────────────────────────────────────────────── */
+/*
+ * GET /clearlog
+ * Resets the CSV buffer, radar log, and radar edge detector.
+ * Redirects back to dashboard after clearing.
+ */
 void handleClearLog(){
     csvHead=0;csvCount=0;radarLogCount=0;prevRADAR=-1;
     server.sendHeader("Location","/");server.send(303,"text/plain","Redirecting");
 }
 
-/* ── /api ────────────────────────────────────────────────────────────────── */
+/*
+ * GET /api
+ * Returns current sensor state as a JSON object.
+ * Intended for external integrations or future mobile app consumption.
+ * Includes all live fields plus the motion event log array.
+ */
 void handleAPI(){
     String json="{\"T\":";json+=T;json+=",\"H\":";json+=H;
     json+=",\"S\":";json+=S_code;json+=",\"F\":";json+=F_val;
     json+=",\"IR\":";json+=IR;json+=",\"AQ\":\"";json+=AQ_STR;
     json+="\",\"AX\":";json+=AX;json+=",\"AY\":";json+=AY;json+=",\"AZ\":";json+=AZ;
-    json+=",\"RADAR\":";json+=RADAR;   /* NEW */
+    json+=",\"RADAR\":";json+=RADAR;
     json+=",\"MOT\":";json+=MOT;json+=",\"TILT\":";json+=TILT;
     json+=",\"SHOCK\":";json+=SHOCK;json+=",\"VIB\":";json+=VIB;
     json+=",\"MLOG\":[";
@@ -424,16 +559,23 @@ void handleAPI(){
     }
     json+="],\"ts\":";json+=(unsigned long)TS;json+="}";
     server.sendHeader("Cache-Control","no-store");
-    server.sendHeader("Access-Control-Allow-Origin","*");
+    server.sendHeader("Access-Control-Allow-Origin","*"); /* Allow cross-origin fetch */
     server.send(200,"application/json",json);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   Setup / Loop
-   ═══════════════════════════════════════════════════════════════════════════ */
+/* =============================================================================
+   Section 10: Setup & Main Loop 
+   ============================================================================= */
+
 void setup(){
+    /* Swap serial pins: ESP8266 default UART0 TX=GPIO1, RX=GPIO3.
+       After swap: TX=GPIO15, RX=GPIO13 — wired to K66F UART1.             */
     Serial.begin(9600);Serial.swap();
+
+    /* Start as Access Point — no external router required */
     WiFi.mode(WIFI_AP);WiFi.softAP("K66_SENSORS","12345678");
+
+    /* Register HTTP route handlers */
     server.on("/",         handleRoot);
     server.on("/api",      handleAPI);
     server.on("/log.csv",  handleCSV);
@@ -442,18 +584,22 @@ void setup(){
 }
 
 void loop(){
-    server.handleClient();
+    server.handleClient(); /* Process any pending HTTP requests */
+
+    /* Accumulate incoming UART characters into bufLine.
+       When a newline is received, parse the complete JSON line. */
     while(Serial.available()){
         char c=(char)Serial.read();
         if(c=='\n'||c=='\r'){
             if(bufLine.length()>0){
-                bufLine.trim();
-                parseLine(bufLine);
-                computeMotion();
-                csvAppend();
-                bufLine="";
+                bufLine.trim();          /* Remove any leading/trailing whitespace */
+                parseLine(bufLine);      /* Extract all sensor fields             */
+                computeMotion();         /* Classify accelerometer movement        */
+                csvAppend();             /* Append to circular log buffer          */
+                bufLine="";              /* Reset for next line                    */
             }
         } else {
+            /* Guard against oversized lines (e.g. UART garbage at boot) */
             if(bufLine.length()<600) bufLine+=c;
         }
     }
